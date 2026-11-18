@@ -3,5 +3,6 @@
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 python3 -m unittest discover -s "${root}/tests" -v
-bash -n "${root}/scripts/check" "${root}/scripts/build-sign" \
+bash "${root}/tests/test-dgx-fan-fleet.sh"
+bash -n "${root}/scripts/check" "${root}/scripts/build-sign" "${root}/tools/dgx-fan-fleet" \
   "${root}/scripts/generate-signing-key" "${root}/dkms.conf"

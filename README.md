@@ -2,6 +2,21 @@
 
 **Pre-cool your Spark, run your job, return to NVIDIA's fan curve.**
 
+> **This is a fork of [christopherowen/dgx-spark-fan-control](https://github.com/christopherowen/dgx-spark-fan-control).**
+> It changes the three things below; everything else is Christopher Owen's work, unchanged.
+>
+> - **Dell Pro Max with GB10 support.** The driver's platform check also accepts Dell's GB10 (FCM1253, board 038RY7), whose
+>   embedded controller answers exactly like NVIDIA's; checked on four units
+>   ([validation](docs/validation.md#dell-pro-max-with-gb10)).
+> - **Named fan profiles** in the service (`performance`, `medium`, `stock`, `max`, `hold-<RPM>`), chosen
+>   by writing one word into a file, a JSON status file other programs can read (its unit gains a runtime
+>   directory), and a guard that forces maximum cooling if a fan reads 0 RPM while the machine is warm
+>   ([profiles](docs/usage.md#choose-a-profile)).
+> - **`dgx-fan-fleet`**, a new tool that sets and reads the profile of several Sparks at once over ssh, with a JSON
+>   interface for dashboards ([several Sparks](docs/fleet.md)).
+>
+> Every profile is still an added minimum: nothing here can cool less than NVIDIA's own curve.
+
 Control a shared minimum fan RPM from Linux userland, or run a temperature-based
 performance curve. A small kernel driver talks to the existing firmware; a
 Python command controls it. NVIDIA's embedded controller (EC) continues to
@@ -18,6 +33,7 @@ apply its own cooling policy throughout.
 | Turn the fans up before a big job | [Pre-cooling](docs/usage.md#pre-cool-before-a-big-job) |
 | Restore the factory fan curve afterward | [NVIDIA automatic control](docs/usage.md#return-to-nvidia-automatic-control) |
 | Pick a fan profile (performance, medium, stock, max, a held speed) | [Profiles](docs/usage.md#choose-a-profile) |
+| Set the profile of several Sparks at once | [Several Sparks](docs/fleet.md) |
 | Upgrade or remove the software | [Updates and removal](docs/maintenance.md) |
 
 ## A typical session

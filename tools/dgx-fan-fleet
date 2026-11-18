@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+# dgx-fan-fleet: the fan profile (and, with a clock tool, the GPU clock limit) of several Sparks at once, from one of them.
+#
+#   dgx-fan-fleet set [--json] PROFILE        write PROFILE into /var/lib/dgx-fan-control/profile on every Spark
+#   dgx-fan-fleet status [--json]             each Spark's /run/dgx-fan-control/status.json, merged
+#   dgx-fan-fleet pin PROFILE --why TEXT      set PROFILE and refuse further changes until unpin (only this command pins)
+#   dgx-fan-fleet unpin
+#   dgx-fan-fleet check PROFILE               exit 0 only if every Spark runs PROFILE, no reading is stale, and no
+#                                             zero-RPM guard or profile error is set (for scripts, e.g. before a benchmark)
+#   dgx-fan-fleet clock set [--json] LIMIT    the GPU clock limit, 2400 2200 2000 or 1800 MHz, through DGX_FAN_CLOCK_TOOL
+#
+# It never touches a fan. The service on each Spark (dgx-fan-control.service) reads the profile file every sample and
+# decides the floor; this tool writes one small file a Spark (as the ssh user, no sudo) and reads the service's status
+# file. Nothing is applied while this tool or ssh is down.
+#
+# PROFILE: stock medium performance max, or hold-<RPM> with any floor of the service's table (2700, 3600 ... 13500). Anything else exits 2, nothing run. Exit codes of set: 0 every Spark took it, 1 some did not (each
+# named, the others still set), 2 usage, 3 pinned (the reason shown, nothing run).
+#
+# The Sparks: this one, and each of DGX_FAN_NODES (ssh targets, space-separated; none by default) over ssh with
+# BatchMode, all at once, each try bounded. A reading older than 10 s is stale; a Spark with no status file (service not
+# running) is read from the kernel directly (cooling device, hwmon, thermal zones: all world-readable) and shown stale.
+#
+# The GPU clock (optional): DGX_FAN_CLOCK_TOOL names a command run as `TOOL LIMIT [targets...]` that sets the limit on this
+# Spark and each target and prints one line a Spark, "<name>: GPU clock ..." when it worked or "<name>: FAILED: <reason>"
+# (<name> is `hostname -s` for this Spark, the target as given for the others). DGX_FAN_CLOCK_STATE names the file on each
+# Spark where that tool records {"limit", "at", "ok", "error"} as JSON; status reports it. Without a tool, clock set exits
+# 2 and status reports no clock. `unlocked` is never offered: the four limits only. A pin refuses clock changes too.
+#
+# Tests: DGX_FAN_SSH (the ssh command), DGX_FAN_DIR (a base directory; each Spark's files go to <base>/<its label>/),
+# DGX_FAN_CLOCK_STATE_DIR (likewise for the clock record), DGX_FAN_THERMAL_ROOT, DGX_FAN_HWMON_ROOT.
+set -u
+PROFILES="stock medium performance max hold-4500 hold-6300 hold-9000"
+CLOCKS="2400 2200 2000 1800"
+GPU_CLOCK=${DGX_FAN_CLOCK_TOOL:-}
+HOLDS="hold-2700 hold-3600 hold-4500 hold-5400 hold-6300 hold-7200 hold-8100 hold-9000 hold-10125 hold-11250 hold-12375 hold-13500"
+STALE_S=10
+SSH=${DGX_FAN_SSH:-ssh}
+NODES=${DGX_FAN_NODES:-}
+me=$(hostname -s)
+labels=("$me" $NODES)
+
+die() { echo "dgx-fan-fleet: $*" >&2; exit "${2:-2}"; }
+valid() { [[ -n ${1:-} && " $PROFILES $HOLDS " == *" $1 "* ]]; }
+dir_of() { if [[ -n ${DGX_FAN_DIR:-} ]]; then echo "$DGX_FAN_DIR/$1"; else echo /var/lib/dgx-fan-control; fi; }
+status_of() { if [[ -n ${DGX_FAN_DIR:-} ]]; then echo "$DGX_FAN_DIR/$1/status.json"; else echo /run/dgx-fan-control/status.json; fi; }
+clock_state_of() { if [[ -n ${DGX_FAN_CLOCK_STATE_DIR:-} ]]; then echo "$DGX_FAN_CLOCK_STATE_DIR/$1/state"; else echo "${DGX_FAN_CLOCK_STATE:-}"; fi; }
+usage() {
+  echo "usage: dgx-fan-fleet set [--json] PROFILE | status [--json] | pin PROFILE --why TEXT | unpin | check PROFILE | clock set [--json] LIMIT" >&2
+  echo "       PROFILE: stock medium performance max hold-<RPM> (RPM: 2700 3600 4500 5400 6300 7200 8100 9000 10125 11250 12375 13500)" >&2
+  exit 2
+}
+
+# on each Spark (args: profile, directory): write the file whole, then rename it; the last line is OK or ERR <reason>
+read -r -d '' SET_SCRIPT <<'SET'
+set -u
+p=$1 d=$2
+mkdir -p "$d" 2>/dev/null
+if printf '%s\n' "$p" > "$d/profile.tmp" 2>/dev/null && chmod 0644 "$d/profile.tmp" 2>/dev/null && mv -f "$d/profile.tmp" "$d/profile" 2>/dev/null; then
+  logger -t dgx-fan-fleet "profile $p written to $d/profile" 2>/dev/null
+  echo OK
+else
+  rm -f "$d/profile.tmp" 2>/dev/null
+  echo "ERR could not write $d/profile"
+fi
+SET
+
+# on each Spark (args: directory, status file, thermal root, hwmon root, clock record): one JSON line, the Spark's clock in it
+read -r -d '' STATUS_SCRIPT <<'STATUS'
+python3 - "$@" <<'PY'
+import glob, json, os, sys, time
+d, status, thermal, hwmon, clock = sys.argv[1:6]
+floor = [0, 2700, 3600, 4500, 5400, 6300, 7200, 8100, 9000, 10125, 11250, 12375, 13500]
+out = {"now": time.time(), "file": None, "fallback": None, "profile_file": None, "error": None, "gpu_clock": None}
+try:
+    with open(clock, "rb") as f:
+        rec = json.loads(f.read(2048))
+    if isinstance(rec, dict):
+        out["gpu_clock"] = {k: rec.get(k) for k in ("limit", "at", "ok", "error")}
+except (OSError, ValueError):
+    pass
+try:
+    with open(os.path.join(d, "profile"), "rb") as f:
+        out["profile_file"] = f.read(64).decode("ascii", "replace").strip()
+except OSError:
+    pass
+try:
+    with open(status, "rb") as f:
+        out["file"] = json.loads(f.read(8192))
+except (OSError, ValueError) as e:
+    out["error"] = "no status file (daemon not answering)" if isinstance(e, FileNotFoundError) else "status file unreadable"
+if out["file"] is None:
+    def rd(p):
+        try:
+            with open(p) as f:
+                return f.read().strip()
+        except OSError:
+            return None
+    fb = {"v": 1, "at": out["now"], "profile": None, "requested": out["profile_file"], "profile_error": None, "state": None,
+          "floor_rpm": None, "hottest_c": None, "filtered_c": None, "rpm": [None, None], "zero_rpm_guard": False,
+          "driver": None, "fallback": True}
+    for c in sorted(glob.glob(os.path.join(thermal, "cooling_device*"))):
+        if rd(c + "/type") == "dgx_ec_fan_floor":
+            try:
+                fb["state"] = int(rd(c + "/cur_state"))
+                fb["floor_rpm"] = floor[fb["state"]]
+            except (TypeError, ValueError, IndexError):
+                pass
+    temps = []
+    for z in glob.glob(os.path.join(thermal, "thermal_zone*/temp")):
+        try:
+            v = int(rd(z))
+            if 0 < v <= 200000:
+                temps.append(v / 1000.0)
+        except (TypeError, ValueError):
+            pass
+    if temps:
+        fb["hottest_c"] = max(temps)
+    for h in sorted(glob.glob(os.path.join(hwmon, "hwmon*"))):
+        if rd(h + "/name") == "dgx_ec_fan":
+            for i in (0, 1):
+                try:
+                    fb["rpm"][i] = int(rd(h + "/fan%d_input" % (i + 1)))
+                except (TypeError, ValueError):
+                    pass
+            break
+    out["fallback"] = fb
+print(json.dumps(out))
+PY
+STATUS
+
+# on this Spark (args: mode, stale seconds, pin file, then label=<result file> ...): merge what the Sparks answered
+read -r -d '' MERGE <<'MERGE'
+import json, os, sys, time
+mode, stale_s, pinfile = sys.argv[1], float(sys.argv[2]), sys.argv[3]
+profile = sys.argv[4] if mode in ("set", "clock") else None
+pairs = sys.argv[5:]
+def last(path):
+    try:
+        lines = [l for l in open(path, errors="replace").read().splitlines() if l.strip()]
+    except OSError:
+        return ""
+    return lines[-1] if lines else ""
+try:
+    pinned = open(pinfile).read().strip() or "pinned"
+except OSError:
+    pinned = None
+nodes = []
+for rank, pair in enumerate(pairs):
+    label, path = pair.split("=", 1)
+    line = last(path)
+    n = {"rank": rank, "host": label, "ok": False, "error": None}
+    if mode == "clock":
+        mine = [l for l in open(path, errors="replace").read().splitlines() if l.startswith(label + ": ")] if os.path.exists(path) else []
+        said = mine[-1][len(label) + 2:] if mine else ""
+        if said.startswith("GPU clock"):
+            n["ok"] = True
+        else:
+            n["error"] = (said[len("FAILED: "):] if said.startswith("FAILED: ") else (said or "no answer"))[:200]
+    elif mode == "set":
+        if line == "OK":
+            n["ok"] = True
+        else:
+            n["error"] = (line[4:] if line.startswith("ERR ") else "no answer: " + (line or "the try stalled"))[:200]
+    else:
+        try:
+            doc = json.loads(line)
+        except ValueError:
+            doc = None
+        if doc is None:
+            n.update(stale=True, age_s=None, status=None, error=("no answer: " + (line or "the try stalled"))[:200])
+        else:
+            st = doc["file"] if doc["file"] is not None else doc["fallback"]
+            fallback = doc["file"] is None
+            age = None if fallback else max(0.0, doc["now"] - float(st.get("at", 0)))
+            n.update(ok=True, status=st, age_s=None if age is None else round(age, 1), gpu_clock=doc.get("gpu_clock"),
+                     stale=fallback or age > stale_s, error=doc["error"] if fallback else None)
+    nodes.append(n)
+if mode == "clock":
+    print(json.dumps({"gpu_clock": profile, "pinned": pinned, "nodes": nodes}))
+    sys.exit(0 if all(n["ok"] for n in nodes) else 1)
+if mode == "set":
+    print(json.dumps({"profile": profile, "pinned": pinned, "nodes": nodes}))
+    sys.exit(0 if all(n["ok"] for n in nodes) else 1)
+reach = [n for n in nodes if n["ok"]]
+seen = {n["status"].get("profile") for n in reach if not n["status"].get("fallback")}
+mixed = len(seen) > 1
+common = next(iter(seen)) if len(seen) == 1 and len(reach) == len(nodes) else None
+limits = {n["gpu_clock"].get("limit") for n in reach if n.get("gpu_clock")}
+clock_mixed = len(limits) > 1
+clock = next(iter(limits)) if len(limits) == 1 else None
+doc = {"at": time.time(), "pinned": pinned, "mixed": mixed, "profile": common, "clock": clock, "clock_mixed": clock_mixed, "nodes": nodes}
+if mode == "json":
+    print(json.dumps(doc))
+    sys.exit(0 if reach else 1)
+if mode == "check":
+    want = sys.argv[4]
+    bad = []
+    for n in nodes:
+        if not n["ok"]:
+            bad.append("%s: not reachable (%s)" % (n["host"], n["error"]))
+            continue
+        s = n["status"]
+        if n["stale"]:
+            bad.append("%s: reading stale (daemon not answering)" % n["host"])
+        if s.get("profile") != want or s.get("requested") != want:
+            bad.append("%s: runs %s (file says %s), not %s" % (n["host"], s.get("profile"), s.get("requested"), want))
+        if s.get("profile_error"):
+            bad.append("%s: profile error: %s" % (n["host"], s["profile_error"]))
+        if s.get("zero_rpm_guard"):
+            bad.append("%s: zero-RPM guard is set" % n["host"])
+    for b in bad:
+        print(b)
+    if not bad:
+        print("every Spark runs %s" % want)
+    sys.exit(1 if bad else 0)
+for n in nodes:
+    if not n["ok"]:
+        print("%s: unreachable: %s" % (n["host"], n["error"]))
+        continue
+    s = n["status"]
+    rpm = "/".join("-" if v is None else str(v) for v in s.get("rpm", [None, None]))
+    hot = "-" if s.get("hottest_c") is None else "%.1fC" % s["hottest_c"]
+    flags = ("  STALE" if n["stale"] else "") + ("  GUARD" if s.get("zero_rpm_guard") else "") + \
+            ("  ERROR: " + s["profile_error"] if s.get("profile_error") else "")
+    print("%s: %s state %s floor %s RPM, fans %s RPM, hottest %s%s%s" % (
+        n["host"], s.get("profile") or ("(daemon not answering; file says %s)" % s.get("requested")), s.get("state"),
+        s.get("floor_rpm"), rpm, hot, "" if n["age_s"] is None else ", %.1f s old" % n["age_s"], flags
+        + ("  clock %s MHz" % n["gpu_clock"].get("limit") if n.get("gpu_clock") else "  clock unknown")
+        + ("" if not n.get("gpu_clock") or n["gpu_clock"].get("ok") else " (FAILED: %s)" % n["gpu_clock"].get("error"))))
+print("profile: %s%s%s" % (common or "none in common", "  MIXED" if mixed else "", "  pinned: " + pinned if pinned else ""))
+print("clock: %s%s" % (("%s MHz" % clock) if clock else "none in common", "  MIXED" if clock_mixed else ""))
+MERGE
+
+# run SCRIPT on every Spark at once; result files $out/0..3 (their last line is the answer)
+fanout() {   # args: script, function of label giving the script's arguments (echoed, shell-quoted)
+  local script=$1 argf=$2 i=0 l args
+  for l in "${labels[@]}"; do
+    args=$($argf "$l")
+    if (( i == 0 )); then
+      eval "timeout -k 2 25 bash -c \"\$script\" _ $args" > "$out/$i" 2>&1 &
+    else
+      timeout -k 5 30 $SSH -n -o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" \
+        -o ControlPersist=60 "$l" "bash -c $(printf '%q' "$script") _ $args" > "$out/$i" 2>&1 &
+    fi
+    i=$((i + 1))
+  done
+  wait
+}
+pairs() { local i=0 l; for l in "${labels[@]}"; do printf '%s=%s\n' "$l" "$out/$i"; i=$((i + 1)); done; }
+pinfile() { echo "$(dir_of "$me")/pin"; }
+pin_reason() { [[ -r $(pinfile) ]] && { head -c 200 "$(pinfile)" | tr '\n' ' ' | sed 's/ *$//'; }; }
+merge() { local mode=$1 prof=${2:-}; mapfile -t P < <(pairs); python3 -c "$MERGE" "$mode" "$STALE_S" "$(pinfile)" "$prof" "${P[@]}"; }
+
+set_args() { printf '%q %q' "$profile" "$(dir_of "$1")"; }
+status_args() { printf '%q %q %q %q %q' "$(dir_of "$1")" "$(status_of "$1")" "${DGX_FAN_THERMAL_ROOT:-/sys/class/thermal}" "${DGX_FAN_HWMON_ROOT:-/sys/class/hwmon}" "$(clock_state_of "$1")"; }
+
+do_set() {   # profile, json?; exit 0/1/3
+  profile=$1
+  local json=$2 reason rc
+  if reason=$(pin_reason) && [[ -n $reason ]]; then
+    if (( json )); then printf '{"profile":%s,"pinned":%s,"nodes":[]}\n' "$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$profile")" \
+      "$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$reason")"; fi
+    echo "dgx-fan-fleet: pinned ($reason): not changing the profile; dgx-fan-fleet unpin first" >&2
+    return 3
+  fi
+  out=$(mktemp -d); trap 'rm -rf "$out"' EXIT
+  fanout "$SET_SCRIPT" set_args
+  merge set "$profile" > "$out/json"; rc=$?
+  if (( json )); then cat "$out/json"; else
+    python3 - "$out/json" "$profile" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+for n in d["nodes"]:
+    print("%s: profile %s written" % (n["host"], sys.argv[2]) if n["ok"] else "%s: FAILED: %s" % (n["host"], n["error"]))
+PY
+  fi
+  return $rc
+}
+
+do_clock() {   # limit, json?; exit 0/1/3 (2: not one of the four)
+  local limit=$1 json=$2 reason rc
+  [[ -n $limit && " $CLOCKS " == *" $limit "* ]] || die "the GPU clock limit must be one of: $CLOCKS (unlocked is not offered here)" 2
+  [[ -n $GPU_CLOCK ]] || die "no GPU clock tool: set DGX_FAN_CLOCK_TOOL (see docs/fleet.md)" 2
+  if reason=$(pin_reason) && [[ -n $reason ]]; then
+    if (( json )); then python3 -c 'import json,sys;print(json.dumps({"gpu_clock":sys.argv[1],"pinned":sys.argv[2],"nodes":[]}))' "$limit" "$reason"; fi
+    echo "dgx-fan-fleet: pinned ($reason): not changing the GPU clock; dgx-fan-fleet unpin first" >&2
+    return 3
+  fi
+  out=$(mktemp -d); trap 'rm -rf "$out"' EXIT
+  timeout -k 5 120 "$GPU_CLOCK" "$limit" $NODES > "$out/clock" 2>&1
+  local i=0 l; : > "$out/pairs"
+  for l in "${labels[@]}"; do printf '%s=%s\n' "$l" "$out/clock" >> "$out/pairs"; done
+  mapfile -t P < "$out/pairs"
+  python3 -c "$MERGE" clock "$STALE_S" "$(pinfile)" "$limit" "${P[@]}" > "$out/json"; rc=$?
+  logger -t dgx-fan-fleet "gpu clock $limit: exit $rc" 2>/dev/null
+  if (( json )); then cat "$out/json"; else cat "$out/clock"; fi
+  return $rc
+}
+
+cmd=${1:-}; shift 2>/dev/null || true
+case $cmd in
+  set)
+    json=0; [[ ${1:-} == --json ]] && { json=1; shift; }
+    valid "${1:-}" || die "profile must be one of: $PROFILES" 2
+    do_set "$1" $json; exit $? ;;
+  status)
+    json=0; [[ ${1:-} == --json ]] && json=1
+    out=$(mktemp -d); trap 'rm -rf "$out"' EXIT
+    fanout "$STATUS_SCRIPT" status_args
+    if (( json )); then merge json; else merge text; fi; exit $? ;;
+  check)
+    valid "${1:-}" || die "profile must be one of: $PROFILES" 2
+    out=$(mktemp -d); trap 'rm -rf "$out"' EXIT
+    fanout "$STATUS_SCRIPT" status_args
+    merge check "$1"; exit $? ;;
+  pin)
+    profile=${1:-}; valid "$profile" || die "profile must be one of: $PROFILES" 2
+    [[ ${2:-} == --why && -n ${3:-} ]] || die "pin needs --why TEXT (the reason status shows)" 2
+    why=$(printf '%s' "$3" | tr '\n' ' ' | head -c 200)
+    do_set "$profile" 0; rc=$?
+    (( rc == 0 )) || { echo "dgx-fan-fleet: not pinned: the profile did not reach every Spark" >&2; exit "$rc"; }
+    mkdir -p "$(dir_of "$me")" && printf '%s\n' "$why" > "$(pinfile)" || die "pin file could not be written" 1
+    logger -t dgx-fan-fleet "pinned $profile: $why" 2>/dev/null
+    echo "pinned: $why"; exit 0 ;;
+  clock)
+    [[ ${1:-} == set ]] || usage
+    shift; json=0; [[ ${1:-} == --json ]] && { json=1; shift; }
+    do_clock "${1:-}" $json; exit $? ;;
+  unpin)
+    rm -f "$(pinfile)"; logger -t dgx-fan-fleet "unpinned" 2>/dev/null; echo "unpinned"; exit 0 ;;
+  *) usage ;;
+esac
