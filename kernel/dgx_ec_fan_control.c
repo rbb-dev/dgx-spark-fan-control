@@ -193,9 +193,19 @@ static void dgx_ec_log_incident(struct dgx_ec_fan_control_data *data)
 
 static bool dgx_ec_is_supported_platform(void)
 {
-	return dmi_match(DMI_SYS_VENDOR, "NVIDIA") &&
-	       dmi_match(DMI_PRODUCT_NAME, "NVIDIA_DGX_Spark") &&
-	       dmi_match(DMI_BOARD_NAME, "P4242");
+	if (dmi_match(DMI_SYS_VENDOR, "NVIDIA") &&
+	    dmi_match(DMI_PRODUCT_NAME, "NVIDIA_DGX_Spark") &&
+	    dmi_match(DMI_BOARD_NAME, "P4242"))
+		return true;
+	/*
+	 * Dell Pro Max with GB10: the same packet relay (partition 0x8003,
+	 * properties 0x109, FF-A 1.2) and the same capability reply.  Its
+	 * sys_vendor reads "Dell  Inc." (two spaces), so match the board vendor.
+	 */
+	return dmi_match(DMI_BOARD_VENDOR, "Dell Inc.") &&
+	       dmi_match(DMI_PRODUCT_NAME, "Dell Pro Max with GB10 FCM1253") &&
+	       dmi_match(DMI_PRODUCT_FAMILY, "DGX Spark") &&
+	       dmi_match(DMI_BOARD_NAME, "038RY7");
 }
 
 static int dgx_ec_validate_transport(struct ffa_device *ffa_dev,

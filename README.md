@@ -57,9 +57,13 @@ policy. See the [state table and performance curve](docs/usage.md#choose-a-fan-f
 ## Compatibility
 
 Originally tested on two **NVIDIA DGX Sparks, board P4242**, with DGX OS 7.5.0,
-kernel **`6.17.0-1029-nvidia`**, and EC firmware **3.5.8**. Other GB10 systems,
-OEM variants, generic kernels, and future firmware are unverified. The driver
-rejects platform or protocol responses outside its observed contract.
+kernel **`6.17.0-1029-nvidia`**, and EC firmware **3.5.8**. This fork also runs
+on the **Dell Pro Max with GB10 (FCM1253, board 038RY7)**: four units with
+DGX OS 7.6, kernel **`7.0.0-1019-nvidia`**, and Dell EC firmware **0x02000c00**,
+whose packet relay and capability reply are the same as EC 3.5.8's (see
+[validation](docs/validation.md#dell-pro-max-with-gb10)). Other GB10 systems,
+generic kernels, and future firmware are unverified. The driver rejects
+platform or protocol responses outside its observed contract.
 
 You need Python 3.10+, matching NVIDIA kernel headers and build tools, and an
 enrolled local signing certificate when Secure Boot is enabled. DKMS is optional;

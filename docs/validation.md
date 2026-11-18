@@ -1,5 +1,31 @@
 # Validation and provenance
 
+## Dell Pro Max with GB10
+
+The Dell Pro Max with GB10 is NVIDIA's GB10 design in Dell's chassis. Its DMI
+identity differs, so upstream's version 0.1.4 refused it; this fork's platform check also
+accepts `board_vendor` "Dell Inc." with product "Dell Pro Max with GB10
+FCM1253", family "DGX Spark" and board "038RY7". (Its `sys_vendor` reads
+"Dell  Inc." with two spaces, so the check matches the board vendor.)
+
+Checked on four units (DGX OS 7.6, kernel `7.0.0-1019-nvidia`, Dell EC
+firmware 0x02000c00, Secure Boot off, the module built by DKMS):
+
+- A read-only probe of the packet relay (`arm-ffa-18`, partition 0x8003,
+  properties 0x109, FF-A 1.2) before the driver was loaded: every operation
+  completed on its first poll. The capability reply was
+  `0100ec0428236207bc34`: revision 1, RPM mode, fan 1 1,260 to 9,000 RPM and
+  fan 2 1,890 to 13,500 RPM, the same as EC 3.5.8's. The lower floor read
+  `0xffff` (unset); telemetry read 2,700 and 4,050 RPM at idle.
+- After loading: `status` reported `state=0/12`; state 12 brought both fans
+  from idle to near their maxima in about six seconds, and `automatic`
+  returned them to the firmware's curve.
+- The performance service ran on all four units, held state 12 at 73.7 C
+  under load, and fell back to state 0 at idle.
+
+Not checked on the Dell: Secure Boot with a self-signed module (the signing
+path is unchanged), suspend and resume.
+
 ## Version 0.1.4 zero-clamp restore
 
 On **2026-10-29** the signed module was built on **dgx4** with DKMS against
