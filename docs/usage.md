@@ -149,6 +149,38 @@ consecutive failures stop the service with exit status 69 and an attempted
 automatic restoration. Systemd leaves it failed for operator recovery instead
 of restarting indefinitely. See [troubleshooting](troubleshooting.md).
 
+## Choose a profile
+
+The service runs one of several named profiles. The name is read every sample
+from `/var/lib/dgx-fan-control/profile` (one word; see
+[installation](installation.md#profiles-and-the-status-file)), so a change takes
+effect within two seconds without restarting anything:
+
+| Profile | What the service does |
+| --- | --- |
+| `performance` | The curve above (the default, and what a missing or invalid file means) |
+| `medium` | A gentler curve: 55°C state 2, 60°C 4, 65°C 6, 70°C 8, 75°C 10, 80°C or above 12 |
+| `stock` | State 0: NVIDIA's own curve alone |
+| `max` | State 12 at all times |
+| `hold-<RPM>` | Never below that floor (2700, 3600, ... 13500), and the performance curve when it asks for more |
+
+```sh
+echo medium > /var/lib/dgx-fan-control/profile
+cat /run/dgx-fan-control/status.json
+```
+
+The file is treated as untrusted input: a symlink, anything but a regular file,
+more than 64 bytes or an unknown name all mean `performance`, and the reason is
+in the status file and the journal. No profile can cool less than NVIDIA's
+curve, because every state is an added minimum.
+
+Each sample also writes `/run/dgx-fan-control/status.json` (readable by
+everyone): the profile in force, the name the file asked for and any error, the
+state and its floor, the hottest and filtered temperatures, both fans' RPM and
+whether the zero-RPM guard is active. That guard forces state 12 if either fan
+reads 0 RPM for three samples in a row while the hottest zone is above 40°C,
+and releases it once both fans turn again.
+
 ## Choose a fan floor
 
 | State | Common floor (RPM) | State | Common floor (RPM) |

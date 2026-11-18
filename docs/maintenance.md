@@ -106,6 +106,10 @@ sudo modprobe dgx_ec_fan_control
 dgx-fan-control status
 ```
 
+Coming from a version without profiles, also create the profile directory
+([profiles and the status file](installation.md#profiles-and-the-status-file));
+without it the service runs the performance curve, as before.
+
 If you want the performance curve again, run
 `sudo systemctl start dgx-fan-control.service`. Otherwise leave it stopped for
 NVIDIA's factory curve. Existing boot enablement is preserved.

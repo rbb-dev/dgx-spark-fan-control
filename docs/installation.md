@@ -239,4 +239,22 @@ sudo journalctl -u dgx-fan-control.service -n 30
 
 The service runs as root to write thermal sysfs, with an empty capability set,
 no network access, and a read-only system filesystem. Module loading is separate.
+
+### Profiles and the status file
+
+The service reads its profile from `/var/lib/dgx-fan-control/profile`. Create
+the directory owned by the account that should choose profiles (it needs no
+other privilege), and start on the performance curve. The service reads the
+file without any capability, so it must stay readable by everyone:
+
+```sh
+sudo install -d -o "$USER" -m 0755 /var/lib/dgx-fan-control
+echo performance > /var/lib/dgx-fan-control/profile
+chmod 0644 /var/lib/dgx-fan-control/profile
+```
+
+Without the file the service runs the performance curve. The unit gives the
+service `/run/dgx-fan-control/` for its status file. See
+[profiles](usage.md#choose-a-profile).
+
 Continue to [pre-cooling and everyday usage](usage.md).

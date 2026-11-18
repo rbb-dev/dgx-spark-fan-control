@@ -17,6 +17,7 @@ apply its own cooling policy throughout.
 | Choose what runs at boot | [Startup modes](docs/installation.md#5-choose-your-startup-mode) |
 | Turn the fans up before a big job | [Pre-cooling](docs/usage.md#pre-cool-before-a-big-job) |
 | Restore the factory fan curve afterward | [NVIDIA automatic control](docs/usage.md#return-to-nvidia-automatic-control) |
+| Pick a fan profile (performance, medium, stock, max, a held speed) | [Profiles](docs/usage.md#choose-a-profile) |
 | Upgrade or remove the software | [Updates and removal](docs/maintenance.md) |
 
 ## A typical session
